@@ -46,3 +46,11 @@ checkpoint, evaluate a LeRobot v3 rollout dataset, render your own value video, 
 - Code: [`third_party/WCM`](third_party/WCM)
 - ModelScope checkpoint: https://modelscope.cn/models/scutyfan/NeurIPS26-WCM-items_handover
 - Example metrics and video: [`examples/wcm`](examples/wcm)
+
+### WCM one-command demo
+
+```bash
+bash quickstart_wcm.sh demo
+```
+
+For checkpoint verification and reproduction details, see [`HANDOFF.md`](HANDOFF.md).
