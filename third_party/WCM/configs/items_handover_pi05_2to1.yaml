@@ -1,0 +1,81 @@
+output_dir: outputs/wcm/items_handover_pi05_all383_2to1
+seed: 3072
+epochs: 5
+per_device_batch_size: 2
+eval_batch_size: 4
+num_workers: 4
+gradient_accumulation_steps: 1
+max_grad_norm: 1.0
+precision: bf16
+log_every: 100
+eval_every_epochs: 1
+save_every_epochs: 5
+expected_world_size: 1
+ddp_timeout_minutes: 30
+deterministic: false
+
+data:
+  repo_id: RoboSynChallenge/items_handover_pi05_all383_2to1_v30_with_return
+  root: ../../lerobot_dataset/wcm_v30/RoboSynChallenge/items_handover_pi05_all383_2to1_v30_with_return
+  revision: null
+  episodes: null
+  video_backend: torchcodec
+  image_keys:
+    - observation.images.cam_high
+    - observation.images.cam_left_wrist
+    - observation.images.cam_right_wrist
+  action_key: action
+  state_key: observation.state
+  return_key: return
+  history_size: 3
+  prediction_horizon: 1
+  val_fraction: 0.2
+  split_seed: 3072
+  split_manifest: ../../lerobot_dataset/wcm_v30/RoboSynChallenge/items_handover_pi05_all383_2to1_v30_with_return/meta/episode_split.json
+  normalize_action: true
+  action_mean: null
+  action_std: null
+  normalization_epsilon: 1.0e-6
+
+model:
+  action_dim: 14
+  state_dim: 14
+  latent_dim: 384
+  max_views: 3
+  trunk_depth: 6
+  trunk_heads: 8
+  trunk_mlp_ratio: 4.0
+  dropout: 0.1
+  max_history: 16
+  value_hidden_dim: 384
+  dynamics_depth: 3
+  action_hidden_dim: 384
+  predict_state_vector: false
+  vision:
+    model_name: google/vit-base-patch16-224-in21k
+    image_size: 224
+    trainable: true
+    pretrained: true
+  language:
+    model_name: openai/clip-vit-base-patch32
+    max_length: 77
+    trainable: false
+    pretrained: true
+    fusion_layers: 2
+    fusion_heads: 8
+    fusion_dropout: 0.0
+
+loss:
+  value_weight: 1.0
+  next_state_weight: 0.1
+  next_state_vector_weight: 0.0
+  sigreg_weight: 0.01
+  sigreg_knots: 17
+  sigreg_num_projections: 1024
+
+optim:
+  lr: 5.0e-5
+  weight_decay: 1.0e-3
+  betas: [0.9, 0.95]
+  warmup_steps: 500
+  min_lr_ratio: 0.1

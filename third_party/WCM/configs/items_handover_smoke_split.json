@@ -1,0 +1,7 @@
+{
+  "schema_version": 1,
+  "seed": 3072,
+  "val_fraction": 0.5,
+  "train": [0],
+  "val": [1]
+}

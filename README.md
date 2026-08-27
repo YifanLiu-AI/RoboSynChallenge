@@ -32,3 +32,17 @@ In addition, you can easily extend your own policys for training and evaluation 
 
 # LeaderBoard
 The full leaderboard and setting can be found in: https://edem-ai.github.io/robosynchallenge.github.io/#/leaderboard.
+---
+
+## WCM: World Critic Model
+
+The `wcm-integration` branch adds WCM training, offline checkpoint evaluation, and a video demo
+that displays the predicted value curve as a RoboSyn rollout progresses.
+
+**Fastest start:** watch [`examples/wcm/episode-000072.mp4`](examples/wcm/episode-000072.mp4), then
+follow [`third_party/WCM/QUICKSTART_ROBOSYN.md`](third_party/WCM/QUICKSTART_ROBOSYN.md) to verify a
+checkpoint, evaluate a LeRobot v3 rollout dataset, render your own value video, or train WCM.
+
+- Code: [`third_party/WCM`](third_party/WCM)
+- ModelScope checkpoint: https://modelscope.cn/models/scutyfan/NeurIPS26-WCM-items_handover
+- Example metrics and video: [`examples/wcm`](examples/wcm)
