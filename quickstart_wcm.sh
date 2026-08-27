@@ -5,6 +5,12 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 MODE="${1:-demo}"
 MODEL_ID="scutyfan/NeurIPS26-WCM-items_handover"
 MODEL_DIR="$ROOT/third_party/WCM/modelscope_wcm"
+UV_BIN="$(command -v uv 2>/dev/null || true)"
+if [[ -z "$UV_BIN" ]]; then
+  for candidate in "$HOME/.local/bin/uv" "$HOME/.cargo/bin/uv"; do
+    if [[ -x "$candidate" ]]; then UV_BIN="$candidate"; break; fi
+  done
+fi
 
 case "$MODE" in
   demo)
@@ -28,20 +34,16 @@ PY
     echo "Open this video: $VIDEO"
     ;;
   verify)
-    command -v python3 >/dev/null || { echo "python3 is required" >&2; exit 1; }
-    python3 - <<'PY'
-try:
-    import modelscope  # noqa: F401
-except ImportError:
-    raise SystemExit("Install ModelScope first: pip install -U modelscope")
-PY
+    [[ -n "$UV_BIN" ]] || { echo "uv is required: https://docs.astral.sh/uv/" >&2; exit 1; }
+    cd "$ROOT/third_party/WCM"
+    "$UV_BIN" sync --frozen --extra download --all-packages
     mkdir -p "$MODEL_DIR"
-    python3 - "$MODEL_ID" "$MODEL_DIR" <<'PY'
-from modelscope import snapshot_download
+    "$UV_BIN" run --frozen python - "$MODEL_ID" "$MODEL_DIR" <<'PY'
+from modelscope import model_file_download
 import sys
-print(snapshot_download(sys.argv[1], local_dir=sys.argv[2]))
+print(model_file_download(sys.argv[1], file_path="wcm/deploy.pt", local_dir=sys.argv[2]))
 PY
-    python3 - "$MODEL_DIR/wcm/deploy.pt" <<'PY'
+    "$UV_BIN" run --frozen python - "$MODEL_DIR/wcm/deploy.pt" <<'PY'
 import sys, torch
 x = torch.load(sys.argv[1], map_location="cpu", weights_only=False)
 assert x["artifact_type"] == "deploy"
@@ -53,8 +55,10 @@ print("history_size=", x["config"]["data"]["history_size"])
 PY
     ;;
   test)
+    [[ -n "$UV_BIN" ]] || { echo "uv is required: https://docs.astral.sh/uv/" >&2; exit 1; }
     cd "$ROOT/third_party/WCM"
-    python3 -m pytest -q tests
+    "$UV_BIN" sync --frozen --extra test --all-packages
+    "$UV_BIN" run --frozen pytest -q tests
     ;;
   *)
     echo "Usage: bash quickstart_wcm.sh {demo|verify|test}" >&2

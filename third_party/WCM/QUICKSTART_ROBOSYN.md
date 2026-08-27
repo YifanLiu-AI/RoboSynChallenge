@@ -16,31 +16,32 @@ Requirements: Ubuntu, Python 3.12, CUDA-capable PyTorch, and ffmpeg.
 ```bash
 git clone --branch wcm-integration https://github.com/oplisty/RoboSynchallenge.git
 cd RoboSynchallenge/third_party/WCM
-python3.12 -m venv .venv
-source .venv/bin/activate
-pip install -U pip
-pip install -e '.[all]'
-pip install -e './episode_value_video[all]'
+curl -LsSf https://astral.sh/uv/install.sh | sh  # skip if uv is already installed
+uv python install 3.12
+uv sync --frozen --extra all --all-packages
 sudo apt-get install -y ffmpeg
 ```
 
 ## 2. Download the items_handover checkpoint
 
 ```bash
-pip install -U modelscope
-python - <<'PY'
-from modelscope import snapshot_download
-print(snapshot_download('scutyfan/NeurIPS26-WCM-items_handover', local_dir='modelscope_wcm'))
+uv run --frozen python - <<'PY'
+from modelscope import model_file_download
+print(model_file_download(
+    'scutyfan/NeurIPS26-WCM-items_handover',
+    file_path='wcm/deploy.pt',
+    local_dir='modelscope_wcm',
+))
 PY
 ```
 
-Use `modelscope_wcm/wcm/deploy.pt` for compact inference, or
-`modelscope_wcm/wcm/best.pt` when full training/resume state is required.
+This downloads only `modelscope_wcm/wcm/deploy.pt` (about 683 MB). Download
+`wcm/best.pt` separately only when full training/resume state is required; a full snapshot is about 2.1 GB.
 
 ## 3. Verify the checkpoint in seconds
 
 ```bash
-python - <<'PY'
+uv run --frozen python - <<'PY'
 import torch
 p = 'modelscope_wcm/wcm/deploy.pt'
 x = torch.load(p, map_location='cpu', weights_only=False)
@@ -55,7 +56,7 @@ PY
 ## 4. Evaluate WCM on a local LeRobot v3 rollout dataset
 
 ```bash
-python -m world_critic.evaluate \
+uv run --frozen python -m world_critic.evaluate \
   --checkpoint modelscope_wcm/wcm/deploy.pt \
   --output-dir outputs/items_handover_eval \
   --split val \
@@ -71,7 +72,7 @@ LeRobot v3 dataset location before evaluation.
 ## 5. Render value changing with rollout
 
 ```bash
-python -m episode_value_video render \
+uv run --frozen python -m episode_value_video render \
   --curves outputs/items_handover_eval/episode_curves/episode_curves.json \
   --checkpoint modelscope_wcm/wcm/deploy.pt \
   --dataset-root /absolute/path/to/items_handover_lerobot_v3 \
@@ -85,7 +86,7 @@ python -m episode_value_video render \
 For a combined evaluate-then-render workflow:
 
 ```bash
-python -m episode_value_video pipeline --help
+uv run --frozen python -m episode_value_video pipeline --help
 ```
 
 ## 6. Train
@@ -93,7 +94,11 @@ python -m episode_value_video pipeline --help
 Edit the dataset root/repo in `configs/items_handover_single_gpu.yaml`, then run:
 
 ```bash
-python -m world_critic.train --config configs/items_handover_single_gpu.yaml
+uv run --frozen python -m world_critic.train --config configs/items_handover_single_gpu.yaml
 ```
 
 Training produces full checkpoints (`best.pt`, `last.pt`, `epoch-*.pt`) and compact `deploy.pt`.
+
+## Fresh-environment problems
+
+Before changing dependencies, read [TROUBLESHOOTING.md](TROUBLESHOOTING.md). It documents the locked Python/PyTorch/torchcodec/Transformers/LeRobot matrix, CUDA and FFmpeg requirements, machine-specific dataset paths, ModelScope download sizes, and offline/proxy setup.

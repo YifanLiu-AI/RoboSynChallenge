@@ -70,3 +70,17 @@ python -m world_critic.train --help
 - GitHub implementation commit: `6dc7fca3ca19b87b12d7fdaeeb3caca3120914c1`.
 - ModelScope upload commit: `9bb9bb451a75a88e0633ff67697783726c561255`.
 - ModelScope remote sizes and SHA256 values were checked through its repository API.
+
+## Reproducible fresh environment
+
+WCM includes `.python-version` and `uv.lock`. Use:
+
+```bash
+cd third_party/WCM
+uv python install 3.12
+uv sync --frozen --extra all --all-packages
+uv run --frozen pytest -q tests
+```
+
+Read `third_party/WCM/TROUBLESHOOTING.md` before changing torch, torchcodec, Transformers, LeRobot,
+FFmpeg, CUDA, or dataset paths.
