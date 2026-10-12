@@ -127,7 +127,7 @@ def eval(env, model, obs):
 
         if env.get_wrapper_attr("is_task_success")():
             break
-        if truncated.any():
+        if bool(np.asarray(truncated).any()):
             break
 
         # Update observation window after each step

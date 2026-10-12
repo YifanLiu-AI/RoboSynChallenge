@@ -5,6 +5,7 @@
 # ----------------------------------------------------------------------------
 
 import os
+import atexit
 import ast
 import sys
 import argparse
@@ -427,6 +428,16 @@ def make_env_from_configs(config, gym_config_dict, action_config_dict):
     from embodichain.lab.sim.cfg import RenderCfg
 
     gym_config = deepcopy(gym_config_dict)
+    if config.get("eval_save_dataset", False):
+        dataset_dir = config.get("eval_dataset_dir")
+        if not dataset_dir or not Path(dataset_dir).is_absolute():
+            raise ValueError("eval_dataset_dir must be an absolute path when saving a dataset")
+        recorders = gym_config.get("env", {}).get("dataset", {})
+        if not recorders:
+            raise ValueError("Task has no configured dataset recorder")
+        for recorder in recorders.values():
+            recorder["params"]["save_path"] = dataset_dir
+            recorder["save_failed_episodes"] = True
     _set_default(gym_config, "num_envs", int(config.get("num_envs", 1)))
     _set_default(gym_config, "device", config.get("device", "cpu"))
     _set_default(gym_config, "headless", bool(config.get("headless", False)))
@@ -441,7 +452,7 @@ def make_env_from_configs(config, gym_config_dict, action_config_dict):
         gym_config,
         manager_modules=CHALLENGE_MANAGER_MODULES,
     )
-    env_cfg.filter_dataset_saving = bool(config.get("filter_dataset_saving", True))
+    env_cfg.filter_dataset_saving = not bool(config.get("eval_save_dataset", False))
     env_cfg.sim_cfg = SimulationManagerCfg(
         headless=gym_config["headless"],
         sim_device=gym_config["device"],
@@ -628,6 +639,20 @@ def main():
     max_episodes = config.get("max_episodes")
     seed = config.get("seed")
     fixed_episode_seed = config.get("eval_fixed_episode_seed")
+    episode_seeds = config.get("eval_episode_seeds")
+    episode_seed_pool = config.get("eval_episode_seed_pool")
+    if episode_seeds is not None:
+        if fixed_episode_seed is not None or not isinstance(episode_seeds, list) or len(episode_seeds) != max_episodes:
+            raise ValueError("eval_episode_seeds must have one entry per episode and cannot use eval_fixed_episode_seed")
+        if any(not isinstance(value, int) or isinstance(value, bool) for value in episode_seeds):
+            raise ValueError("eval_episode_seeds must contain integer seeds")
+    if episode_seed_pool is not None:
+        if fixed_episode_seed is not None or episode_seeds is not None:
+            raise ValueError("eval_episode_seed_pool cannot be combined with fixed episode seeds")
+        if not isinstance(episode_seed_pool, list) or len(episode_seed_pool) < max_episodes:
+            raise ValueError("eval_episode_seed_pool must contain at least max_episodes candidates")
+        if any(not isinstance(value, int) or isinstance(value, bool) for value in episode_seed_pool):
+            raise ValueError("eval_episode_seed_pool must contain integer seeds")
     headless = config.get("headless")
     expert_check = bool(config.get("eval_expert_check", True))
     if expert_check:
@@ -688,6 +713,7 @@ def main():
     skipped_episode_seeds = []
     candidate_seed_attempts = 0
     current_episode_seed_attempts = 0
+    seed_pool_cursor = 0
     print(f"\n{'='*25} Starting Evaluation {'='*25}\n")
     print(f"  Policy: {policy_name}  |  Task: {task_name}")
     print(f"  Episodes: {max_episodes}  |  Seed: {seed}")
@@ -727,11 +753,20 @@ def main():
                     "expert/action space."
                 )
 
+            if episode_seed_pool is not None and seed_pool_cursor >= len(episode_seed_pool):
+                raise RuntimeError(
+                    "eval_episode_seed_pool exhausted before collecting "
+                    f"{max_episodes} expert-feasible episodes; "
+                    f"attempted {seed_pool_cursor} candidates"
+                )
             ep_seed = (
-                int(fixed_episode_seed)
-                if fixed_episode_seed is not None
+                int(episode_seeds[episode]) if episode_seeds is not None
+                else int(episode_seed_pool[seed_pool_cursor]) if episode_seed_pool is not None
+                else int(fixed_episode_seed) if fixed_episode_seed is not None
                 else int(rng.randint(0, 2**31 - 1))
             )
+            if episode_seed_pool is not None:
+                seed_pool_cursor += 1
             candidate_seed_attempts += 1
             current_episode_seed_attempts += 1
             candidate_index = candidate_seed_attempts - 1
@@ -762,7 +797,7 @@ def main():
                         f"({expert_result['reason']}, "
                         f"planned_steps={expert_result['expert_plan_steps']})"
                     )
-                    if fixed_episode_seed is not None:
+                    if fixed_episode_seed is not None or episode_seeds is not None:
                         raise RuntimeError(
                             f"Fixed episode seed {ep_seed} failed the expert "
                             "feasibility check; no replacement seed can be "
@@ -827,6 +862,9 @@ def main():
                 if video_recorder:
                     video_recorder.close_episode(success=episode_success)
 
+            if config.get("eval_save_dataset", False):
+                env.reset(seed=ep_seed, options={"save_data": True})
+
             success_count += int(episode_success)
             effective_steps = env_steps if episode_success else max_env_steps
             action_steps.append(effective_steps)
@@ -862,7 +900,7 @@ def main():
     finally:
         if video_recorder:
             video_recorder.close_episode(success=False)
-        env.close()
+        atexit.register(env.close)
 
     inference_call_count = len(all_inference_times)
     average_action_steps = float(np.mean(action_steps))
@@ -894,6 +932,9 @@ def main():
             "timeout_action_steps": max_env_steps,
             "seed": seed,
             "fixed_episode_seed": fixed_episode_seed,
+            "episode_seeds": episode_seeds,
+            "episode_seed_pool": episode_seed_pool,
+            "save_dataset": bool(config.get("eval_save_dataset", False)),
         },
         "inference_timing_scope": (
             "raw observation preprocessing and transfer through executable action; "
