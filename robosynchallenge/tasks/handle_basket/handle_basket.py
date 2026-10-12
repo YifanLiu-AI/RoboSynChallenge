@@ -28,7 +28,11 @@ from robosynchallenge.managers.events import visualize_rigid_body_pose
 from embodichain_tasks.tableware.base_agent_env import BaseAgentEnv
 from .action_bank import HandleBasketActionBank
 
-__all__ = ["HandleBasketEnv", "HandleBasketTestEnv", "HandleBasketAgentEnv"]
+__all__ = [
+    "HandleBasketEnv",
+    "HandleBasketTestEnv",
+    "HandleBasketAgentEnv",
+]
 
 
 @register_env("HandleBasket", max_episode_steps=600)
@@ -36,8 +40,9 @@ class HandleBasketEnv(EmbodiedEnv):
     def __init__(self, cfg: EmbodiedEnvCfg = None, **kwargs):
         super().__init__(cfg, **kwargs)
 
-        self.action_config = kwargs.get("action_config", None)
-        self.affordance_datas = {}
+        action_config = kwargs.get("action_config", None)
+        if action_config is not None:
+            self.action_config = action_config
 
         # Defaults used by handle_basket action config.
         self.milk_grasp_pose_object = np.eye(4, dtype=np.float32)
@@ -54,6 +59,19 @@ class HandleBasketEnv(EmbodiedEnv):
         self.agent_qpos_flip_mode = "delta"
         # Keep old pose prior optional so v2 configs can use raw registered poses.
         self.use_legacy_pose_prior = bool(kwargs.get("use_legacy_pose_prior", False))
+
+        self._success_flag = torch.zeros(
+            self.num_envs, dtype=torch.bool, device=self.device
+        )
+        self._hb_origin_captured = torch.zeros(
+            self.num_envs, dtype=torch.bool, device=self.device
+        )
+        self._hb_stable_steps = torch.zeros(
+            self.num_envs, dtype=torch.long, device=self.device
+        )
+        self._hb_skip_first_eval = True
+        self._hb_orig_basket_xy = None  # (num_envs, 2)
+        self._hb_orig_basket_z = None  # (num_envs,)
 
     @staticmethod
     def _to_matrix4(data: np.ndarray | torch.Tensor | list | tuple) -> np.ndarray:
@@ -270,23 +288,99 @@ class HandleBasketEnv(EmbodiedEnv):
                         actions[:, 0, active_idx] = local_action_data[:, i]
 
         return actions
-    def is_task_success(self, **kwargs) -> torch.Tensor:
+
+    def compute_task_state(self, **kwargs):
         basket = self.sim.get_rigid_object("basket")
         milk = self.sim.get_rigid_object("milk")
         basket_pose = basket.get_local_pose(to_matrix=True)
         milk_pose = milk.get_local_pose(to_matrix=True)
+
         basket_xy = basket_pose[:, :2, 3]
+        basket_z = basket_pose[:, 2, 3]
         milk_xy = milk_pose[:, :2, 3]
+        milk_z = milk_pose[:, 2, 3]
+
+        if self._hb_orig_basket_xy is None:
+            self._hb_orig_basket_xy = torch.full_like(basket_xy, float("nan"))
+            self._hb_orig_basket_z = torch.full_like(basket_z, float("nan"))
+
+        # 首帧（reset 后的第一次评估）仅跳过原点采集，避免把出生帧当原点
+        first_eval = getattr(self, "_hb_skip_first_eval", True)
+        self._hb_skip_first_eval = False
+
+        capture_mask = ~self._hb_origin_captured
+        if (not first_eval) and capture_mask.any():
+            self._hb_orig_basket_xy[capture_mask] = basket_xy[capture_mask]
+            self._hb_orig_basket_z[capture_mask] = basket_z[capture_mask]
+            self._hb_origin_captured[capture_mask] = True
+
+        IN_BASKET_DIST = 0.10
+        MOVE_Y_DELTA = 0.15
+        Z_LIFT_DELTA = 0.01
+        REQUIRED_STABLE_STEPS = 55
+
         dist = torch.linalg.norm(milk_xy - basket_xy, dim=-1)
-        up = milk_pose[:, 2, 3] > basket_pose[:, 2, 3]
-        return dist < 0.08 and up
+        in_basket = (dist < IN_BASKET_DIST) & (milk_z > basket_z)
+
+        y_disp = basket_xy[:, 1] - self._hb_orig_basket_xy[:, 1]
+        x_disp = self._hb_orig_basket_xy[:, 0] - basket_xy[:, 0]
+        z_disp = basket_z - self._hb_orig_basket_z
+        picked = z_disp > Z_LIFT_DELTA
+        moved_left = (y_disp > MOVE_Y_DELTA) & (picked | in_basket)
+
+        goal_hold = moved_left & in_basket
+        self._hb_stable_steps = torch.where(
+            goal_hold,
+            self._hb_stable_steps + 1,
+            torch.zeros_like(self._hb_stable_steps),
+        )
+        current_success = self._hb_stable_steps >= REQUIRED_STABLE_STEPS
+
+        self._success_flag |= current_success
+
+        metrics = {
+            "milk_basket_dist": dist,
+            "basket_x_disp": x_disp,
+            "basket_y_disp": y_disp,
+            "basket_z_lift": z_disp,
+            "in_basket": in_basket,
+            "picked": picked,
+            "moved_left": moved_left,
+            "stable_steps": self._hb_stable_steps,
+        }
+        fail = torch.zeros_like(self._success_flag, dtype=torch.bool)
+        success = torch.zeros_like(fail, dtype=torch.bool)
+        return success, fail, metrics
+
+    def is_task_success(self, **kwargs) -> torch.Tensor:
+        """Success when the carried basket moves left with milk inside stably."""
+        return self._success_flag
+
+    def reset(self, seed: Optional[int] = None, options: Optional[Dict] = None):
+        obs, info = super().reset(seed=seed, options=options)
+
+        if options is None:
+            options = {}
+        reset_ids = options.get(
+            "reset_ids",
+            torch.arange(self.num_envs, dtype=torch.int32, device=self.device),
+        )
+        self._success_flag[reset_ids] = False
+        self._hb_origin_captured[reset_ids] = False
+        self._hb_stable_steps[reset_ids] = 0
+        self._hb_skip_first_eval = True
+        if self._hb_orig_basket_xy is not None:
+            self._hb_orig_basket_xy[reset_ids] = float("nan")
+            self._hb_orig_basket_z[reset_ids] = float("nan")
+
+        return obs, info
 
 @register_env("HandleBasketTest", max_episode_steps=600)
 class HandleBasketTestEnv(HandleBasketEnv):
     def compute_task_state(self, **kwargs):
     # It is difficult to determine whether a task has failed or succeeded based on conditions,
     # and manual assessment is required.
-        return torch.zeros(self.num_envs, dtype=torch.bool), torch.zeros(self.num_envs, dtype=torch.bool), None
+        return torch.zeros(self.num_envs, dtype=torch.bool), torch.zeros(self.num_envs, dtype=torch.bool), {}
     def is_task_success(self, **kwargs):
         return torch.ones(self.num_envs, dtype=torch.bool)
 

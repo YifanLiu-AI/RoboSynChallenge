@@ -5,12 +5,16 @@
 # ----------------------------------------------------------------------------
 
 import os
+import atexit
+import ast
 import sys
 import argparse
 import importlib
 import json
+import platform
+import random
 import subprocess
-import time
+from contextlib import ExitStack, contextmanager, redirect_stderr, redirect_stdout
 from copy import deepcopy
 from datetime import datetime
 from pathlib import Path
@@ -74,9 +78,7 @@ def load_policy_adapter(policy_name):
     functions from its top-level namespace (via __init__.py):
 
         get_model(usr_args: dict) -> model
-        eval(env: gym.Env, model, obs) -> obs
-            Optionally return (obs, diagnostics: dict). Diagnostics can include
-            "state" and "actions"; timing is measured by this evaluator.
+        eval(env: gym.Env, model, obs) -> (obs, info, truncated, inference_times)
         reset_model(model) -> None
     """
     add_policy_dependency_paths(policy_name)
@@ -105,12 +107,18 @@ def _as_int_or_none(value):
     return int(value)
 
 
+def select_cuda_device(config):
+    """Align an unqualified policy CUDA device with the simulator GPU."""
+    pytorch_device = str(config.get("pytorch_device", ""))
+    if pytorch_device.startswith("cuda") and torch.cuda.is_available():
+        torch.cuda.set_device(int(config.get("gpu_id", 0)))
+
+
 def resolve_episode_max_steps(config, gym_config):
-    """Use the larger env-step limit from deploy config and gym config."""
+    """Use the task env limit, with the deploy limit only as a fallback."""
     deploy_max_steps = _as_int_or_none(config.get("max_steps"))
     gym_max_steps = _as_int_or_none(gym_config.get("max_episode_steps"))
-    candidates = [value for value in (deploy_max_steps, gym_max_steps) if value is not None]
-    max_env_steps = max(candidates) if candidates else 300
+    max_env_steps = gym_max_steps or deploy_max_steps or 300
     return max_env_steps, deploy_max_steps, gym_max_steps
 
 
@@ -291,25 +299,119 @@ class RecordingEnvProxy:
         return bool(value)
 
 
-def create_video_recorder(config):
-    if not config.get("eval_video_log", False):
-        return None
+def prepare_episode_reset(env, seed):
+    """Seed every RNG used by task randomizers before a reproducible reset.
 
+    EmbodiChain's ``reset(seed=...)`` seeds Torch only. RoboSynChallenge
+    reset events also use Python's ``random`` and NumPy, so an expert pre-check
+    followed by a plain reset would not necessarily recreate the same scene.
+    Keep this compatibility shim here instead of changing EmbodiChain itself.
+    """
+    seed = int(seed)
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed(seed)
+        torch.cuda.manual_seed_all(seed)
+
+    target = getattr(env, "unwrapped", env)
+    np_random, actual_seed = gym.utils.seeding.np_random(seed)
+    target._np_random = np_random
+    target._np_random_seed = int(actual_seed)
+
+    seeded_spaces = set()
+    for owner in (env, target):
+        for name in ("action_space", "observation_space", "single_action_space"):
+            space = getattr(owner, name, None)
+            if space is None or id(space) in seeded_spaces:
+                continue
+            seeded_spaces.add(id(space))
+            seed_method = getattr(space, "seed", None)
+            if callable(seed_method):
+                seed_method(int(actual_seed))
+
+    target._robosyn_episode_seed = int(actual_seed)
+    return int(actual_seed)
+
+
+@contextmanager
+def suppress_expert_output():
+    with open(os.devnull, "w") as sink, ExitStack() as restore:
+        sys.stdout.flush()
+        sys.stderr.flush()
+        for fd in (1, 2):
+            saved_fd = os.dup(fd)
+            restore.callback(os.close, saved_fd)
+            restore.callback(os.dup2, saved_fd, fd)
+            os.dup2(sink.fileno(), fd)
+
+        with redirect_stdout(sink), redirect_stderr(sink):
+            try:
+                yield
+            finally:
+                sink.flush()
+
+
+def check_episode_feasibility(env, seed):
+    """Accept a seed when the expert generates a non-empty action plan.
+    """
+    result = {
+        "feasible": False,
+        "reason": "expert_action_generation_failed",
+        "expert_plan_steps": 0,
+    }
+    try:
+        seed = prepare_episode_reset(env, seed)
+        env.reset(seed=seed, options={"save_data": False})
+        action_list = env.get_wrapper_attr("create_demo_action_list")(
+            action_sentence=0
+        )
+        if action_list is None:
+            return result
+        result["expert_plan_steps"] = len(action_list)
+        if result["expert_plan_steps"] == 0:
+            result["reason"] = "expert_action_list_empty"
+            return result
+
+        result["feasible"] = True
+        result["reason"] = "expert_planning_succeeded"
+        return result
+    except Exception as exc:
+        message = " ".join(str(exc).split())
+        result["reason"] = f"expert_exception:{type(exc).__name__}:{message}"
+        return result
+
+
+def create_eval_run_dir(config):
+    """Create the shared directory for metrics and optional videos."""
     timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-    save_root = Path("eval_result")
+    save_root = Path(config.get("eval_result_dir") or "eval_result")
+    checkpoint_path = config.get("checkpoint_path")
+    model_name = config.get("model_name")
+    if not model_name and checkpoint_path:
+        model_name = Path(checkpoint_path).name
     save_dir = (
         save_root
         / str(config.get("task_name"))
         / str(config.get("policy_name"))
         / str(config.get("setting"))
         / str(config.get("train_config_name"))
-        / str(config.get("model_name"))
+        / str(model_name)
         / timestamp
-        / "videos"
     )
+    save_dir.mkdir(parents=True, exist_ok=True)
+    return save_dir
+
+
+def create_video_recorder(config, run_dir=None):
+    if not config.get("eval_video_log", False):
+        return None
+
+    run_dir = Path(run_dir) if run_dir else create_eval_run_dir(config)
     obs_keys = config.get("eval_video_obs_keys", config.get("eval_video_obs_key", "cam_high"))
     return EpisodeVideoRecorder(
-        save_dir=save_dir,
+        save_dir=run_dir / "videos",
         obs_keys=obs_keys,
         fps=10,
         crf=23,
@@ -326,6 +428,16 @@ def make_env_from_configs(config, gym_config_dict, action_config_dict):
     from embodichain.lab.sim.cfg import RenderCfg
 
     gym_config = deepcopy(gym_config_dict)
+    if config.get("eval_save_dataset", False):
+        dataset_dir = config.get("eval_dataset_dir")
+        if not dataset_dir or not Path(dataset_dir).is_absolute():
+            raise ValueError("eval_dataset_dir must be an absolute path when saving a dataset")
+        recorders = gym_config.get("env", {}).get("dataset", {})
+        if not recorders:
+            raise ValueError("Task has no configured dataset recorder")
+        for recorder in recorders.values():
+            recorder["params"]["save_path"] = dataset_dir
+            recorder["save_failed_episodes"] = True
     _set_default(gym_config, "num_envs", int(config.get("num_envs", 1)))
     _set_default(gym_config, "device", config.get("device", "cpu"))
     _set_default(gym_config, "headless", bool(config.get("headless", False)))
@@ -340,7 +452,7 @@ def make_env_from_configs(config, gym_config_dict, action_config_dict):
         gym_config,
         manager_modules=CHALLENGE_MANAGER_MODULES,
     )
-    env_cfg.filter_dataset_saving = bool(config.get("filter_dataset_saving", True))
+    env_cfg.filter_dataset_saving = not bool(config.get("eval_save_dataset", False))
     env_cfg.sim_cfg = SimulationManagerCfg(
         headless=gym_config["headless"],
         sim_device=gym_config["device"],
@@ -362,7 +474,12 @@ def make_env_from_configs(config, gym_config_dict, action_config_dict):
             else {"action_config": action_config_dict}
         )
 
-    env = gym.make(id=gym_config["id"], cfg=env_cfg, **action_kwargs)
+    env = gym.make(
+        id=gym_config["id"],
+        max_episode_steps=max_env_steps,
+        cfg=env_cfg,
+        **action_kwargs,
+    )
     return env, gym_config
 
 def find_gym_config(config):
@@ -434,6 +551,48 @@ def extract_instruction_from_gym_config(gym_config):
     return _find_instruction_recursive(gym_config)
 
 
+def _read_cpu_model():
+    try:
+        with open("/proc/cpuinfo", "r", encoding="utf-8") as cpuinfo:
+            for line in cpuinfo:
+                if line.lower().startswith("model name"):
+                    return line.split(":", 1)[1].strip()
+    except OSError:
+        pass
+    return platform.processor() or "unknown"
+
+
+def collect_platform_metadata():
+    """Describe the hardware/software platform that gives timing its context."""
+    accelerators = []
+    if torch.cuda.is_available():
+        accelerators = [
+            torch.cuda.get_device_name(device_index)
+            for device_index in range(torch.cuda.device_count())
+        ]
+    return {
+        "operating_system": platform.platform(),
+        "machine": platform.machine(),
+        "cpu": _read_cpu_model(),
+        "accelerators": accelerators,
+        "cuda_visible_devices": os.environ.get("CUDA_VISIBLE_DEVICES"),
+        "python_version": platform.python_version(),
+        "torch_version": torch.__version__,
+        "torch_cuda_version": torch.version.cuda,
+    }
+
+
+def format_platform(platform_metadata):
+    accelerators = platform_metadata["accelerators"]
+    accelerator_text = ", ".join(accelerators) if accelerators else "none detected"
+    return (
+        f"GPU={accelerator_text}; CPU={platform_metadata['cpu']}; "
+        f"OS={platform_metadata['operating_system']}; "
+        f"PyTorch={platform_metadata['torch_version']}; "
+        f"CUDA={platform_metadata['torch_cuda_version']}"
+    )
+
+
 def parse_args_and_config():
     parser = argparse.ArgumentParser(description="RoboSynChallenge Unified Policy Evaluator")
 
@@ -457,16 +616,19 @@ def parse_args_and_config():
             key = args.overrides[i].lstrip("-")
             value = args.overrides[i + 1]
             try:
-                value = eval(value)
-            except Exception:
+                # Parse literals without resolving names such as "random".
+                value = ast.literal_eval(value)
+            except (ValueError, SyntaxError):
                 pass
             config[key] = value
 
     return config
 
 
+
 def main():
     config = parse_args_and_config()
+    select_cuda_device(config)
 
     policy_name = config.get("policy_name")
     if not policy_name:
@@ -477,7 +639,32 @@ def main():
     max_episodes = config.get("max_episodes")
     seed = config.get("seed")
     fixed_episode_seed = config.get("eval_fixed_episode_seed")
+    episode_seeds = config.get("eval_episode_seeds")
+    episode_seed_pool = config.get("eval_episode_seed_pool")
+    if episode_seeds is not None:
+        if fixed_episode_seed is not None or not isinstance(episode_seeds, list) or len(episode_seeds) != max_episodes:
+            raise ValueError("eval_episode_seeds must have one entry per episode and cannot use eval_fixed_episode_seed")
+        if any(not isinstance(value, int) or isinstance(value, bool) for value in episode_seeds):
+            raise ValueError("eval_episode_seeds must contain integer seeds")
+    if episode_seed_pool is not None:
+        if fixed_episode_seed is not None or episode_seeds is not None:
+            raise ValueError("eval_episode_seed_pool cannot be combined with fixed episode seeds")
+        if not isinstance(episode_seed_pool, list) or len(episode_seed_pool) < max_episodes:
+            raise ValueError("eval_episode_seed_pool must contain at least max_episodes candidates")
+        if any(not isinstance(value, int) or isinstance(value, bool) for value in episode_seed_pool):
+            raise ValueError("eval_episode_seed_pool must contain integer seeds")
     headless = config.get("headless")
+    expert_check = bool(config.get("eval_expert_check", True))
+    if expert_check:
+        max_seed_attempts_per_episode = int(
+            config.get("eval_max_seed_attempts_per_episodes", 100)
+        )
+        if max_seed_attempts_per_episode < 1:
+            raise ValueError(
+                "eval_max_seed_attempts_per_episodes must be greater than zero."
+            )
+    else:
+        max_seed_attempts_per_episode = 1
 
     # Load policy adapter
     print(f"Loading policy: {policy_name}")
@@ -498,7 +685,9 @@ def main():
     if instruction:
         env._current_instruction = instruction
         print(f"Using instruction from gym_config: {instruction}")
-    video_recorder = create_video_recorder(config)
+    run_dir = create_eval_run_dir(config)
+    result_path = run_dir / "evaluation_metrics.json"
+    video_recorder = create_video_recorder(config, run_dir=run_dir)
     reset_sync_steps = int(config.get("eval_reset_sync_steps", 0))
     eval_env = (
         RecordingEnvProxy(env, video_recorder, reset_sync_steps=reset_sync_steps)
@@ -514,35 +703,127 @@ def main():
     print("Model created successfully.")
 
     # Evaluation loop
+    platform_metadata = collect_platform_metadata()
     rng = np.random.RandomState(seed)
     success_count = 0
+    action_steps = []
+    all_inference_times = []
+    episode_inference_totals = []
+    episode_results = []
+    skipped_episode_seeds = []
+    candidate_seed_attempts = 0
+    current_episode_seed_attempts = 0
+    seed_pool_cursor = 0
     print(f"\n{'='*25} Starting Evaluation {'='*25}\n")
     print(f"  Policy: {policy_name}  |  Task: {task_name}")
     print(f"  Episodes: {max_episodes}  |  Seed: {seed}")
+    print(
+        "  Expert planning feasibility check: "
+        f"{'enabled' if expert_check else 'disabled'}"
+        + (
+            " (max candidate seeds per episode: "
+            f"{max_seed_attempts_per_episode})"
+            if expert_check
+            else ""
+        )
+    )
     print(
         f"  Max env steps: {max_env_steps} "
         f"(deploy_config.max_steps={deploy_max_steps}, "
         f"gym_config.max_episode_steps={gym_max_steps})"
     )
+    print(f"  Timing platform: {format_platform(platform_metadata)}")
+    print(f"  Metrics file: {result_path}")
     print(f"{'='*70}\n")
 
     try:
-        for episode in range(max_episodes):
+        episode = 0
+        while episode < max_episodes:
+            if current_episode_seed_attempts == 0:
+                print(
+                    f"\nStarting episode {episode + 1}/{max_episodes}",
+                    flush=True,
+                )
+            if current_episode_seed_attempts >= max_seed_attempts_per_episode:
+                raise RuntimeError(
+                    "Could not find an expert-feasible seed for policy episode "
+                    f"{episode + 1}/{max_episodes} after "
+                    f"{current_episode_seed_attempts} candidates. Increase "
+                    "eval_max_seed_attempts_per_episodes or inspect the task "
+                    "expert/action space."
+                )
+
+            if episode_seed_pool is not None and seed_pool_cursor >= len(episode_seed_pool):
+                raise RuntimeError(
+                    "eval_episode_seed_pool exhausted before collecting "
+                    f"{max_episodes} expert-feasible episodes; "
+                    f"attempted {seed_pool_cursor} candidates"
+                )
             ep_seed = (
-                int(fixed_episode_seed)
-                if fixed_episode_seed is not None
+                int(episode_seeds[episode]) if episode_seeds is not None
+                else int(episode_seed_pool[seed_pool_cursor]) if episode_seed_pool is not None
+                else int(fixed_episode_seed) if fixed_episode_seed is not None
                 else int(rng.randint(0, 2**31 - 1))
             )
+            if episode_seed_pool is not None:
+                seed_pool_cursor += 1
+            candidate_seed_attempts += 1
+            current_episode_seed_attempts += 1
+            candidate_index = candidate_seed_attempts - 1
+            episode_attempt_index = current_episode_seed_attempts - 1
+            expert_result = None
+
+            if expert_check:
+                with suppress_expert_output():
+                    expert_result = check_episode_feasibility(
+                        eval_env,
+                        seed=ep_seed,
+                    )
+                if not expert_result["feasible"]:
+                    skipped = {
+                        "candidate_index": candidate_index,
+                        "episode_index": episode,
+                        "episode_attempt_index": episode_attempt_index,
+                        "seed": ep_seed,
+                        "reason": expert_result["reason"],
+                        "expert_plan_steps": expert_result["expert_plan_steps"],
+                    }
+                    skipped_episode_seeds.append(skipped)
+                    print(
+                        f" Expert Feasibility Check Attempt {current_episode_seed_attempts}/"
+                        f"{max_seed_attempts_per_episode} "
+                        f", seed {ep_seed}: \033[93mSKIP\033[0m; "
+                        f"check failed "
+                        f"({expert_result['reason']}, "
+                        f"planned_steps={expert_result['expert_plan_steps']})"
+                    )
+                    if fixed_episode_seed is not None or episode_seeds is not None:
+                        raise RuntimeError(
+                            f"Fixed episode seed {ep_seed} failed the expert "
+                            "feasibility check; no replacement seed can be "
+                            "selected while eval_fixed_episode_seed is set."
+                        )
+                    continue
+                print(
+                    f" Expert Feasibility Check Attempt {current_episode_seed_attempts}/"
+                    f"{max_seed_attempts_per_episode} "
+                    f", seed {ep_seed}: \033[92mFEASIBLE\033[0m; "
+                    f"check succeeded; "
+                    f"planned_steps={expert_result['expert_plan_steps']}"
+                )
+
             if video_recorder:
                 video_recorder.start_episode(episode, ep_seed)
 
             episode_success = False
-            episode_policy_eval_times = []
+            inference_times = []
             env_steps = 0
-            inference_count = 0
             progress_bar = None
             try:
-                obs, info = eval_env.reset(seed=ep_seed)
+                # Expert planning consumes RNG state. Re-seed immediately
+                # before reset so the policy sees the identical candidate scene.
+                ep_seed = prepare_episode_reset(eval_env, ep_seed)
+                obs, info = eval_env.reset(seed=ep_seed, options={"save_data": False})
                 policy_pkg.reset_model(model)
                 progress_bar = tqdm(
                     total=max_env_steps,
@@ -553,25 +834,26 @@ def main():
                 )
 
                 while env_steps < max_env_steps:
-                    inference_count += 1
-                    policy_eval_start = time.perf_counter()
-                    obs, info, truncated = policy_pkg.eval(eval_env, model, obs)
-                    policy_eval_time_s = time.perf_counter() - policy_eval_start
-                    episode_policy_eval_times.append(policy_eval_time_s)
-
+                    obs, info, truncated, new_times = policy_pkg.eval(
+                        eval_env, model, obs
+                    )
+                    inference_times.extend(new_times)
                     env_steps = int(info["elapsed_steps"].item())
 
-                    progress_bar.update(max(0, min(env_steps, max_env_steps) - progress_bar.n))
+                    progress_bar.update(
+                        max(0, min(env_steps, max_env_steps) - progress_bar.n)
+                    )
                     progress_bar.set_postfix(
-                        infer=inference_count,
-                        infer_time=f"{policy_eval_time_s:.3f}s",
+                        inference=len(inference_times),
+                        infer_time=f"{new_times[-1]:.3f}s" if new_times else "cached",
                     )
 
-                    if not truncated and env.get_wrapper_attr("is_task_success")():
+                    is_truncated = RecordingEnvProxy._as_done(truncated)
+                    if not is_truncated and env.get_wrapper_attr("is_task_success")():
                         episode_success = True
                         progress_bar.write("Task success!")
                         break
-                    if truncated:
+                    if is_truncated:
                         progress_bar.write("Task timeout!")
                         break
             finally:
@@ -580,29 +862,134 @@ def main():
                 if video_recorder:
                     video_recorder.close_episode(success=episode_success)
 
-            avg_policy_eval_time = float(np.mean(episode_policy_eval_times))
+            if config.get("eval_save_dataset", False):
+                env.reset(seed=ep_seed, options={"save_data": True})
 
-            if episode_success:
-                success_count += 1
-                status = "\033[92mSUCCESS\033[0m"
-            else:
-                status = "\033[91mFAIL\033[0m"
-
-            print(
-                f"  Episode {episode+1} policy eval timing: "
-                f"avg={avg_policy_eval_time:.6f}s over "
-                f"{len(episode_policy_eval_times)} inference calls, "
-                f"env_steps={env_steps}/{max_env_steps}"
+            success_count += int(episode_success)
+            effective_steps = env_steps if episode_success else max_env_steps
+            action_steps.append(effective_steps)
+            all_inference_times.extend(inference_times)
+            episode_inference_totals.append(sum(inference_times))
+            episode_results.append(
+                {
+                    "episode_index": episode,
+                    "candidate_index": candidate_index,
+                    "episode_attempt_index": episode_attempt_index,
+                    "seed": ep_seed,
+                    "success": episode_success,
+                    "action_steps": effective_steps,
+                    "expert_plan_steps": (
+                        expert_result["expert_plan_steps"]
+                        if expert_result is not None
+                        else None
+                    ),
+                }
             )
-            print(f"  [{episode+1:3d}/{max_episodes}] {status}  "
-                  f"(success rate: {success_count}/{episode+1} = {100*success_count/(episode+1):.1f}%)")
+            episode_average = float(np.mean(inference_times)) if inference_times else 0
+            status = "\033[92mSUCCESS\033[0m" if episode_success else "\033[91mFAIL\033[0m"
+            print(
+                f"  Episode {episode+1}: {status}; action_steps="
+                f"{effective_steps}/{max_env_steps}; inference="
+                f"{episode_average:.6f}s "
+                f"over {len(inference_times)} calls"
+            )
+            print(f"  [{episode+1:3d}/{max_episodes}] success rate: "
+                  f"{success_count}/{episode+1} = {100*success_count/(episode+1):.1f}%")
+            episode += 1
+            current_episode_seed_attempts = 0
     finally:
         if video_recorder:
             video_recorder.close_episode(success=False)
-        env.close()
+        atexit.register(env.close)
 
+    inference_call_count = len(all_inference_times)
+    average_action_steps = float(np.mean(action_steps))
+    summary = {
+        "episode_count": len(action_steps),
+        "success_count": success_count,
+        "success_rate": success_count / len(action_steps),
+        "average_action_steps": average_action_steps,
+        "average_action_steps_ratio": average_action_steps / max_env_steps,
+        "inference_call_count": inference_call_count,
+        "average_inference_calls_per_episode": inference_call_count / len(action_steps),
+        "average_inference_time_seconds": (
+            float(np.mean(all_inference_times)) if all_inference_times else None
+        ),
+        "average_inference_time_per_episode_seconds": float(
+            np.mean(episode_inference_totals)
+        ),
+    }
+    result_payload = {
+        "schema_version": 1,
+        "created_at": datetime.now().astimezone().isoformat(),
+        "config": {
+            "policy": policy_name,
+            "task": task_name,
+            "setting": config.get("setting"),
+            "checkpoint_path": config.get("checkpoint_path"),
+            "dp_num_inference_steps": config.get("dp_num_inference_steps"),
+            "episode_count": max_episodes,
+            "timeout_action_steps": max_env_steps,
+            "seed": seed,
+            "fixed_episode_seed": fixed_episode_seed,
+            "episode_seeds": episode_seeds,
+            "episode_seed_pool": episode_seed_pool,
+            "save_dataset": bool(config.get("eval_save_dataset", False)),
+        },
+        "inference_timing_scope": (
+            "raw observation preprocessing and transfer through executable action; "
+            "env.step excluded"
+        ),
+        "platform": platform_metadata,
+        "summary": summary,
+        "episodes": episode_results,
+        "feasibility_filter": {
+            "enabled": expert_check,
+            "max_candidate_seed_attempts_per_episode": (
+                max_seed_attempts_per_episode
+            ),
+            "candidate_seed_attempt_count": candidate_seed_attempts,
+            "accepted_episode_count": len(episode_results),
+            "skipped_seed_count": len(skipped_episode_seeds),
+            "skipped_seeds": skipped_episode_seeds,
+        },
+    }
+    with result_path.open("w", encoding="utf-8") as result_file:
+        json.dump(result_payload, result_file, indent=2, ensure_ascii=False)
+        result_file.write("\n")
+
+    average_inference_time = summary["average_inference_time_seconds"]
     print(f"\n{'='*50}")
-    print(f"  Evaluation Results Summary: {success_count}/{max_episodes} ({100*success_count/max_episodes:.1f}%)")
+    print(
+        f"  Evaluation Results Summary: {success_count}/{max_episodes} "
+        f"({100*success_count/max_episodes:.1f}%)"
+    )
+    print(
+        f"  Average action steps: {summary['average_action_steps']:.2f}/"
+        f"{max_env_steps} ({100*summary['average_action_steps_ratio']:.2f}%; "
+        f"failed episodes count as {max_env_steps} steps)"
+    )
+    if average_inference_time is None:
+        print("  Average inference time: n/a (no inference calls recorded)")
+    else:
+        print(
+            f"  Average inference latency: {average_inference_time:.6f}s "
+            f"({1000*average_inference_time:.3f}ms) over "
+            f"{summary['inference_call_count']} model calls"
+        )
+        print(
+            "  Average total inference time per episode: "
+            f"{summary['average_inference_time_per_episode_seconds']:.6f}s "
+            f"over {summary['average_inference_calls_per_episode']:.2f} model calls"
+        )
+    print(f"  Timing platform: {format_platform(platform_metadata)}")
+    if expert_check:
+        print(
+            "  Expert feasibility filter: "
+            f"accepted {len(episode_results)}/{candidate_seed_attempts} candidate "
+            f"seeds; skipped {len(skipped_episode_seeds)}"
+        )
+    print(f"  Metrics saved to: {result_path}")
     print(f"{'='*50}")
 
 

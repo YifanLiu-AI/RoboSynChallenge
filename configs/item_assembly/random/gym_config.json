@@ -1,7 +1,7 @@
 {
     "id": "ItemAssembly",
     "max_episodes": 100,
-    "max_episode_steps": 361,
+    "max_episode_steps": 500,
     "env": {
         "events": {
             "random_light": {
@@ -13,15 +13,6 @@
                     "position_range": [[-0.5, -0.5, 2], [0.5, 0.5, 2]],
                     "color_range": [[0.6, 0.6, 0.6], [1, 1, 1]],
                     "intensity_range": [10.0, 30.0]
-                }
-            },
-            "random_table_height": {
-                "func": "randomize_rigid_object_pose",
-                "mode": "reset",
-                "params": {
-                    "entity_cfg": {"uid": "table"},
-                    "position_range": [[0.0, 0.0, -0.05], [0.0, 0.0, 0.05]],
-                    "relative_position": true
                 }
             },
             "random_camera_high_intrinsics": {

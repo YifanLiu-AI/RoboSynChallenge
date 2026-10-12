@@ -22,6 +22,7 @@ import openpi.policies.droid_policy as droid_policy
 import openpi.policies.libero_policy as libero_policy
 import openpi.shared.download as _download
 import openpi.shared.normalize as _normalize
+import openpi.shared.nnx_utils as nnx_utils
 import openpi.training.droid_rlds_dataset as droid_rlds_dataset
 import openpi.training.misc.polaris_config as polaris_config
 import openpi.training.misc.roboarena_config as roboarena_config
@@ -432,6 +433,51 @@ class LeRobotEmbodiChainDataConfig(DataConfigFactory):
             action_sequence_keys=self.action_sequence_keys,
         )
 
+
+@dataclasses.dataclass(frozen=True)
+class LeRobotRoboSynDataConfig(DataConfigFactory):
+    """Data transforms for the official RoboSyn LeRobot datasets."""
+
+    extra_delta_transform: bool = True
+    action_sequence_keys: Sequence[str] = ("action",)
+
+    @override
+    def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
+        # The official RoboSyn datasets use these keys directly. Keep this mapping
+        # local to the RoboSyn config so the generic EmbodiChain example remains unchanged.
+        repack_transform = _transforms.Group(
+            inputs=[
+                _transforms.RepackTransform(
+                    {
+                        "observation/image": "observation.images.cam_high",
+                        "observation/left_wrist_image": "observation.images.cam_left_wrist",
+                        "observation/right_wrist_image": "observation.images.cam_right_wrist",
+                        "observation/state": "observation.state",
+                        "actions": "action",
+                        "prompt": "prompt",
+                    }
+                )
+            ]
+        )
+
+        data_transforms = _transforms.Group(
+            inputs=[libero_policy.EmbodiChainInputs(model_type=model_config.model_type)],
+            outputs=[libero_policy.EmbodiChainOutputs()],
+        )
+        if self.extra_delta_transform:
+            delta_action_mask = _transforms.make_bool_mask(7, 7)
+            data_transforms = data_transforms.push(
+                inputs=[_transforms.DeltaActions(delta_action_mask)],
+                outputs=[_transforms.AbsoluteActions(delta_action_mask)],
+            )
+
+        return dataclasses.replace(
+            self.create_base_config(assets_dirs, model_config),
+            repack_transforms=repack_transform,
+            data_transforms=data_transforms,
+            model_transforms=ModelTransformFactory()(model_config),
+            action_sequence_keys=self.action_sequence_keys,
+        )
 
 
 @dataclasses.dataclass(frozen=True)
@@ -863,6 +909,51 @@ _CONFIGS = [
         weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
         num_train_steps=20_000,
         batch_size=64,
+        fsdp_devices=1,
+    ),
+    TrainConfig(
+        name="pi05_sample_loading_rft_action_lora",
+        project_name="RoboSyn",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            action_horizon=50,
+            paligemma_variant="gemma_2b",
+            action_expert_variant="gemma_300m_lora",
+        ),
+        data=LeRobotRoboSynDataConfig(
+            repo_id="RoboSynChallenge/cobotmagic_Sim_sample_loading",
+            base_config=DataConfig(prompt_from_task=True),
+            assets=AssetsConfig(
+                assets_dir="/home/user/shiyi/challenge/eval-rollout/RoboSynChallenge-latest/policy/pi05/checkpoints/"
+                "pi05_base_robosynchallenge_full/sample_loading_original_20k/19999/assets"
+            ),
+            extra_delta_transform=True,
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader(
+            "/home/user/shiyi/challenge/eval-rollout/RoboSynChallenge-latest/policy/pi05/checkpoints/"
+            "pi05_base_robosynchallenge_full/sample_loading_original_20k/19999/params"
+        ),
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=100,
+            peak_lr=2.5e-6,
+            decay_steps=20_000,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        # Freeze PaliGemma, the action-expert base weights, and every non-LoRA
+        # parameter; only action-expert LoRA matrices remain trainable.
+        freeze_filter=nnx.All(
+            nnx.Param,
+            nnx.Not(nnx_utils.PathRegex(".*llm.*_1.*lora.*")),
+        ),
+        ema_decay=None,
+        checkpoint_base_dir="/home/user/shiyi/challenge/openpi_comet_dataflywheel/checkpoints",
+        assets_base_dir="/home/user/shiyi/challenge/openpi_comet_dataflywheel/assets",
+        batch_size=1,
+        num_workers=2,
+        num_train_steps=20_000,
+        save_interval=5_000,
+        keep_period=5_000,
+        wandb_enabled=False,
         fsdp_devices=1,
     ),
     TrainConfig(
