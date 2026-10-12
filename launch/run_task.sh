@@ -1,5 +1,7 @@
 #!/bin/bash
 
+set -euo pipefail
+
 # Usage: ./run_task.sh <task_name> [random | clear] [extra_args...]
 # Examples:
 #   ./run_task.sh beaker_mixer_duel random
@@ -85,6 +87,7 @@ echo "Running command:"
 echo "${RUN_CMD[@]}"
 echo "========================================="
 
+RUN_STARTED_AT=$(date +%s)
 "${RUN_CMD[@]}"
 sleep 5;
 
@@ -99,6 +102,12 @@ if [ "$FORMAT" == "2_1" ]; then
     else
         DATASET_ID=$(basename "$LATEST_REL_PATH")
         DATASET_ROOT="$REPO_ROOT/lerobot_dataset/$TASK_NAME"
+        DATASET_PATH="$REPO_ROOT/lerobot_dataset/$LATEST_REL_PATH"
+
+        if [ ! -d "$DATASET_PATH" ] || [ "$(stat -c %Y "$DATASET_PATH")" -lt "$RUN_STARTED_AT" ]; then
+            echo -e "\033[1;31mError: Latest dataset was not produced by this run.\033[0m"
+            exit 1
+        fi
 
         echo -e "Found New Dataset: \033[1;32m$DATASET_ID\033[0m"
 
@@ -114,4 +123,3 @@ if [ "$FORMAT" == "2_1" ]; then
     fi
 fi
 chmod 777 -R "$REPO_ROOT/lerobot_dataset/"
-

@@ -252,3 +252,4 @@ if __name__ == "__main__":
     except Exception as e:
         log_warning(f"An error occurred during environment execution: {e}")
         env.close()
+        raise

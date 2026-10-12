@@ -852,7 +852,7 @@ _CONFIGS = [
         name="pi05_base_robosynchallenge_full",
         model=pi0_config.Pi0Config(pi05=True,action_horizon=50),
         data=LeRobotEmbodiChainDataConfig(
-            repo_id="your_repo_id",
+            repo_id="RoboSynChallenge/cobotmagic_Real_click_bell",
             # Replace with your repo-id
             base_config=DataConfig(prompt_from_task=True),
             # EmbodiChain datasets are usually absolute-action targets.
